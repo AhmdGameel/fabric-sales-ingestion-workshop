@@ -1,53 +1,144 @@
 # Microsoft Fabric Sales Ingestion Workshop
 
-Resources for my **Global Fabric Day** workshop.
-
-## What you'll find
-
-* Sample sales CSV files
-* PySpark Notebook code
-* Simple end-to-end ingestion demo using Microsoft Fabric
+This repository contains the resources used during my **Global Fabric Day** workshop.
 
 ## Architecture
 
-```text
+```
 CSV Files
     │
     ▼
 OneLake (Landing)
     │
     ▼
-Notebook (PySpark)
+Bronze (Raw)
     │
     ▼
-Lakehouse (sales)
+Silver (Transformed)
     │
     ▼
-Archive
+Gold (Business Ready)
 ```
 
-## Files
+## Dataset
 
-* **data/** → Sample CSV files
-* **notebook/** → Notebook code used in the workshop
+Upload the sample CSV files from the **data** folder into:
 
-## Steps
-
-1. Create a Fabric Workspace.
-2. Create a Lakehouse.
-3. Create **landing** and **archive** folders.
-4. Upload the CSV files to **Files/landing**.
-5. Create a Notebook and copy the code from `notebook/Load_Sales_to_Lakehouse.py`.
-6. Add the Notebook to a Data Pipeline.
-7. Run the Pipeline.
-
-The notebook will:
-
-* Load all CSV files into the **sales** table.
-* Create the table if it doesn't exist.
-* Append new records.
-* Move processed files to the **archive** folder.
+```
+Files/landing
+```
 
 ---
 
-**Author:** Ahmed Gamel
+# Bronze Layer
+
+Reads all CSV files from the Landing folder and performs an upsert into the Bronze Delta table using `order_id`.
+
+```python
+from delta.tables import DeltaTable
+
+df = (
+    spark.read
+    .option("header", "true")
+    .option("inferSchema", "true")
+    .csv("Files/landing/*.csv")
+)
+
+bronze_table = "bronze_sales"
+
+if not spark.catalog.tableExists(bronze_table):
+
+    df.write \
+        .format("delta") \
+        .mode("overwrite") \
+        .saveAsTable(bronze_table)
+
+else:
+
+    bronze = DeltaTable.forName(spark, bronze_table)
+
+    (
+        bronze.alias("target")
+        .merge(
+            df.alias("source"),
+            "target.order_id = source.order_id"
+        )
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+```
+
+---
+
+# Silver Layer
+
+Reads the Bronze table and enriches the data by adding calculated business columns.
+
+```python
+from pyspark.sql.functions import *
+
+bronze_df = spark.table("bronze_sales")
+
+silver_df = (
+    bronze_df
+    .withColumn(
+        "profit_margin_pct",
+        round(
+            (col("gross_profit_usd") / col("net_revenue_usd")) * 100,
+            2
+        )
+    )
+    .withColumn("order_year", year("order_date"))
+    .withColumn("order_month", month("order_date"))
+)
+
+silver_df.write \
+    .mode("overwrite") \
+    .format("delta") \
+    .saveAsTable("silver_sales")
+```
+
+---
+
+# Gold Layer
+
+Creates a business-ready table by aggregating sales metrics per country.
+
+```python
+from pyspark.sql.functions import *
+
+gold_df = (
+    spark.table("silver_sales")
+    .groupBy("country")
+    .agg(
+        sum("net_revenue_usd").alias("total_sales"),
+        sum("gross_profit_usd").alias("total_profit"),
+        count("*").alias("orders")
+    )
+)
+
+gold_df.write \
+    .mode("overwrite") \
+    .format("delta") \
+    .saveAsTable("gold_sales")
+```
+
+---
+
+## Project Flow
+
+```
+Landing CSV Files
+        │
+        ▼
+bronze_sales
+        │
+        ▼
+silver_sales
+        │
+        ▼
+gold_sales
+```
+
+---
